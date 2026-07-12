@@ -63,6 +63,12 @@ def evaluate(tree: Any, env: dict[str, Any]) -> int:
     if kind == "if":
         _, cond, then_t, else_t = tree
         return evaluate(then_t, env) if _eval_cond(cond, env) else evaluate(else_t, env)
+    if kind == "let":
+        # local variable binding (RSI layer 7): compute a value ONCE, name it, reuse it in the body.
+        # Scope is lexical + isolated: the bound name lives only inside `body` — a reference to it
+        # anywhere else sees no binding (env.get default 0), so temp vars never leak out of their let.
+        _, name, val_t, body_t = tree
+        return evaluate(body_t, {**env, name: evaluate(val_t, env)})
     _, op, left, right = tree
     try:
         return int(_OPS[op](evaluate(left, env), evaluate(right, env)))
@@ -126,6 +132,9 @@ def to_source(tree: Any) -> str:
         _, cond, then_t, else_t = tree
         _, cop, cl, cr = cond
         return f"({to_source(then_t)} if {to_source(cl)} {cop} {to_source(cr)} else {to_source(else_t)})"
+    if kind == "let":
+        _, name, val_t, body_t = tree
+        return f"(let {name} = {to_source(val_t)} in {to_source(body_t)})"
     _, op, left, right = tree
     return f"({to_source(left)} {op} {to_source(right)})"
 
@@ -151,12 +160,14 @@ def _random_source(list_vars: tuple[str, ...], rng: random.Random) -> Any:
 
 
 def random_tree(vars_: list[str], rng: random.Random, depth: int = 2, *, control_flow: bool = False,
-                list_vars: tuple[str, ...] = (), library: tuple[Any, ...] = ()) -> Any:
+                list_vars: tuple[str, ...] = (), library: tuple[Any, ...] = (),
+                let_binding: bool = False) -> Any:
     """A random program tree of at most `depth`. Leaves are vars/constants (or len(list) with
     `list_vars`, or a whole reusable sub-program from `library`); `control_flow` allows `if`;
-    `list_vars` allows a bounded `fold`. The library is the COMPOSITIONAL PRIOR: a program already
-    solved (sum, len) can be dropped in as one leaf, so composing sum+len is a single grow, not a
-    lucky rediscovery of both halves — the No-LLM 'learned building blocks' (DreamCoder-style, sans
+    `list_vars` allows a bounded `fold`; `let_binding` allows a local `let t = value in body` where the
+    body may reuse the bound value (RSI layer 7). The library is the COMPOSITIONAL PRIOR: a program
+    already solved (sum, len) can be dropped in as one leaf, so composing sum+len is a single grow, not
+    a lucky rediscovery of both halves — the No-LLM 'learned building blocks' (DreamCoder-style, sans
     neural recognizer)."""
     if depth <= 0 or (rng.random() < 0.35):
         if library and rng.random() < 0.4:
@@ -164,8 +175,16 @@ def random_tree(vars_: list[str], rng: random.Random, depth: int = 2, *, control
         if list_vars and rng.random() < 0.25:
             return ("len", _random_source(list_vars, rng))
         return ("var", rng.choice(vars_)) if (vars_ and rng.random() < 0.7) else ("const", rng.randint(0, 5))
-    sub = lambda: random_tree(vars_, rng, depth - 1, control_flow=control_flow,  # noqa: E731
-                              list_vars=list_vars, library=library)
+    sub = lambda v=vars_: random_tree(v, rng, depth - 1, control_flow=control_flow,  # noqa: E731
+                                      list_vars=list_vars, library=library, let_binding=let_binding)
+    if let_binding and vars_ and rng.random() < 0.18:
+        # bind a value to a temp, then build a body that may reuse it (2+ uses = the win over inlining)
+        name = f"_t{rng.randint(0, 2)}"
+        value = random_tree(vars_, rng, depth - 1, control_flow=control_flow, list_vars=list_vars,
+                            library=library)
+        body = random_tree(vars_ + [name], rng, depth - 1, control_flow=control_flow,
+                           list_vars=list_vars, library=library, let_binding=let_binding)
+        return ("let", name, value, body)
     if list_vars and not library and rng.random() < 0.3:
         return ("fold", rng.choice(list(_OPS)), ("const", rng.choice([0, 1])),
                 _random_source(list_vars, rng))
@@ -174,13 +193,79 @@ def random_tree(vars_: list[str], rng: random.Random, depth: int = 2, *, control
     return ("op", rng.choice(list(_OPS)), sub(), sub())
 
 
+def _subtrees(t: Any):
+    """Yield every node in a tree (for finding a repeated subexpression to factor into a let)."""
+    if isinstance(t, tuple) and t:
+        yield t
+        for c in t[1:]:
+            if isinstance(c, tuple):
+                yield from _subtrees(c)
+
+
+def _count(t: Any, target: Any) -> int:
+    return sum(1 for s in _subtrees(t) if s == target)
+
+
+def _replace(t: Any, target: Any, repl: Any) -> Any:
+    if t == target:
+        return repl
+    if isinstance(t, tuple) and t:
+        return tuple([t[0]] + [_replace(c, target, repl) if isinstance(c, tuple) else c for c in t[1:]])
+    return t
+
+
+def _has_temp(t: Any) -> bool:
+    if isinstance(t, tuple) and t:
+        if t[0] == "var" and isinstance(t[1], str) and t[1].startswith("_t"):
+            return True
+        if t[0] == "let":
+            return True
+        return any(_has_temp(c) for c in t[1:] if isinstance(c, tuple))
+    return False
+
+
+def factor_let(tree: Any, rng: random.Random) -> Any:
+    """The let payoff: find a non-trivial subexpression that occurs 2+ times, compute it ONCE under a
+    temp name, and replace every occurrence with that name — `(a+b)*(a+b)` → `let t=(a+b) in t*t`. This
+    collapses the search for a repeated motif (discover it once, reuse it), and shrinks the program.
+    Only factors temp-free arithmetic/list subexpressions so scoping stays sound (value is evaluated in
+    the outer env; the name lives only in the rewritten body)."""
+    cands = [s for s in set(_subtrees(tree))
+             if s[0] in ("op", "if", "fold", "len") and not _has_temp(s) and _count(tree, s) >= 2]
+    if not cands:
+        return tree
+    target = rng.choice(cands)
+    name = f"_t{rng.randint(0, 2)}"
+    if _count(target, ("var", name)) or _has_temp(tree):     # avoid shadowing an existing temp
+        name = f"_t{rng.randint(3, 6)}"
+    body = _replace(tree, target, ("var", name))
+    return ("let", name, target, body)
+
+
 def mutate(tree: Any, vars_: list[str], rng: random.Random, *, control_flow: bool = False,
-           list_vars: tuple[str, ...] = (), library: tuple[Any, ...] = ()) -> Any:
+           list_vars: tuple[str, ...] = (), library: tuple[Any, ...] = (),
+           let_binding: bool = False) -> Any:
     """One local edit: change an operator/comparison, tweak a constant, swap a leaf's variable/list,
-    regrow a small subtree, or COMPOSE the whole tree with a library building block. The verifier's
-    failing examples are the (symbolic) 'gradient' that selection follows — a wrong output nudges the
-    population, an error would localize the fault."""
+    regrow a small subtree, COMPOSE the whole tree with a library building block, or (with
+    `let_binding`) FACTOR a repeated subexpression into a local `let`. The verifier's failing examples
+    are the (symbolic) 'gradient' that selection follows — a wrong output nudges the population."""
     kind = tree[0]
+    if let_binding and kind != "let":
+        if rng.random() < 0.09:
+            # self-apply: S -> (S op S). This CREATES the repeated subexpression (e.g. a+b -> (a+b)*
+            # (a+b) = a square) that factor_let then names — so x^2-shaped targets become reachable.
+            return ("op", rng.choice(list(_OPS)), tree, tree)
+        if rng.random() < 0.14:
+            factored = factor_let(tree, rng)              # name & reuse a repeated subexpression
+            if factored is not tree:
+                return factored
+    if kind == "let":
+        _, name, val_t, body_t = tree
+        if rng.random() < 0.5:
+            return ("let", name, mutate(val_t, vars_, rng, control_flow=control_flow,
+                                        list_vars=list_vars, library=library), body_t)
+        return ("let", name, val_t, mutate(body_t, vars_ + [name], rng, control_flow=control_flow,
+                                           list_vars=list_vars, library=library, let_binding=let_binding))
     if library and rng.random() < 0.16:
         # compose: (current program) OP (a solved sub-program) — this is the single grow that turns
         # a discovered `sum` into `sum + len`, so composition is reachable, not a lucky rediscovery.
@@ -257,14 +342,16 @@ def graded_fitness(tree: Any, tests: list[tuple[dict[str, Any], int]]) -> float:
 
 def evolve(tests: list[tuple[dict[str, Any], int]], vars_: list[str], *, pop: int = 60,
            generations: int = 60, rng_seed: int = 7, control_flow: bool = False,
-           list_vars: tuple[str, ...] = (), library: tuple[Any, ...] = (), log=None) -> dict[str, Any]:
+           list_vars: tuple[str, ...] = (), library: tuple[Any, ...] = (), let_binding: bool = False,
+           log=None) -> dict[str, Any]:
     """Gradient-free program search: a population of trees, ranked by the smoothed verifier, elitism +
     mutated offspring, until a candidate passes every example EXACTLY (or the budget ends). No
     differentiable core — the interpreter's free judgment is the only signal. `control_flow` allows
     conditionals; `list_vars` allows bounded folds; `library` supplies solved sub-programs as reusable
-    building blocks (the compositional prior that makes sum+len reachable)."""
+    building blocks; `let_binding` allows local variables (compute once, reuse) — the search can factor
+    a repeated subexpression into a `let`, collapsing rediscovery of the same motif."""
     rng = random.Random(rng_seed)
-    kw = dict(control_flow=control_flow, list_vars=list_vars, library=library)
+    kw = dict(control_flow=control_flow, list_vars=list_vars, library=library, let_binding=let_binding)
     population = [random_tree(vars_, rng, depth=3, **kw) for _ in range(pop)]
     best, best_exact, solved_gen, gen = None, -1.0, None, 0
     for gen in range(1, generations + 1):

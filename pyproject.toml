@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atanor-vibecode"
+version = "0.1.0"
+description = "No-LLM, verifier-guided program-synthesis engine: learns to code by trial-and-error against a free exact oracle, with self-curriculum and primitive invention. No gradient, no neural core."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "ATANOR (Cozystone)" }]
+keywords = ["program-synthesis", "genetic-programming", "no-llm", "verifier-guided", "dreamcoder", "self-improvement"]
+dependencies = []   # standard library only — this is the point
+
+[project.urls]
+Homepage = "https://github.com/Cozystone/ATANOR-VibeCode"
+
+[project.scripts]
+atanor-vibecode = "atanor_vibecode.auto_curriculum:run"
+
+[tool.setuptools.packages.find]
+include = ["atanor_vibecode*"]
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+testpaths = ["atanor_vibecode/tests"]

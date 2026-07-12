@@ -33,7 +33,9 @@ growth. It does not conjure new mathematics from nothing.
 from __future__ import annotations
 
 import json
+import os
 import random
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -358,9 +360,29 @@ def _as_tree(t: Any) -> Any:
     return t
 
 
-def save_state(path: Path, state: dict[str, Any]) -> None:
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Crash-safe write: serialize to a sibling temp file, flush+fsync it to disk, then os.replace it
+    onto the target. os.replace is atomic on POSIX and Windows (same volume), so a power loss mid-write
+    leaves EITHER the old file intact OR the new one complete — never a half-written, corrupt file.
+    (Plain write_text does NOT give this — it truncates the target first.)"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def save_state(path: Path, state: dict[str, Any]) -> None:
+    _atomic_write_text(path, json.dumps(state, ensure_ascii=False))
 
 
 def run(rounds: int = 8, *, state_path: Path | None = None, journal_path: Path | None = None,

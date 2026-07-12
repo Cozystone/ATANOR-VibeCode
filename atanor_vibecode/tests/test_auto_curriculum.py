@@ -8,13 +8,36 @@ import random
 from atanor_vibecode.auto_curriculum import (
     _FAMILIES,
     _arity,
+    _atomic_write_text,
     autonomous_round,
     compose_target,
     load_state,
     new_state,
     run,
+    save_state,
 )
 from atanor_vibecode.code_evolver import evaluate, to_source
+
+
+def test_save_state_is_atomic_and_durable(tmp_path):
+    # crash-safety: the write must be atomic (temp + os.replace), leave no stray temp files, and NEVER
+    # corrupt a pre-existing good file. A power loss mid-write yields old-intact-or-new-complete.
+    sp = tmp_path / "state.json"
+    st = new_state()
+    st["round"] = 7
+    save_state(sp, st)
+    assert load_state(sp)["round"] == 7
+    save_state(sp, {**st, "round": 8})                 # overwrite an existing file
+    assert load_state(sp)["round"] == 8                # cleanly replaced, not appended/corrupted
+    assert not list(tmp_path.glob("*.tmp"))            # no leftover temp files
+    # a truncated/corrupt file must not crash the loader — it falls back to a fresh state
+    sp.write_text("{ this is not valid json", encoding="utf-8")
+    assert load_state(sp)["round"] == 0                # graceful recovery, no exception
+    # the atomic helper itself replaces content wholesale
+    p = tmp_path / "x.txt"
+    _atomic_write_text(p, "hello")
+    _atomic_write_text(p, "world")
+    assert p.read_text(encoding="utf-8") == "world"
 
 
 def test_composed_target_is_a_real_verifiable_program():
